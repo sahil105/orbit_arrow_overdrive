@@ -471,13 +471,184 @@ void main() {
       expect(game.campaignRetries, retry);
     }
     game.phase = Phase.lost;
-    expect(game.retryAdDue(1), isTrue);
+    for (var retry = 5; retry <= 16; retry++) {
+      game.campaignRetries = retry - 1;
+      expect(game.retryAdDue(1), retry % 4 == 0, reason: 'Retry $retry');
+    }
     p.vip = true;
     expect(game.retryAdDue(1), isFalse);
     expect(game.startCampaign(2), isTrue);
     expect(game.campaignRetries, 0);
     await tester.pumpWidget(const SizedBox());
     await p.save();
+  });
+
+  testWidgets('Armory cannot open during a pending retry ad', (tester) async {
+    final p = Profile();
+    final ad = Completer<bool>();
+    await tester.pumpWidget(
+      OrbitApp(
+        profile: p,
+        commerce: CommerceHooks(campaignAd: () => ad.future),
+      ),
+    );
+    final game = tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((paint) => paint.painter)
+        .whereType<OrbitPainter>()
+        .single
+        .game;
+    game.phase = Phase.lost;
+    game.campaignRetries = 3;
+    game.updateHud();
+    await tester.pump();
+
+    await tester.tap(find.text('RETRY · AD BREAK'));
+    await tester.tap(find.text('ARROW ARMORY'));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byType(AlertDialog), findsNothing);
+
+    ad.complete(true);
+    await tester.pump();
+    expect(game.phase, Phase.playing);
+    await tester.tap(find.text('ARMORY'));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byType(AlertDialog), findsOneWidget);
+    await tester.tap(find.text('CLOSE'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byType(AlertDialog), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await p.save();
+  });
+
+  testWidgets('eighth failure offers a skip that requires an earned reward', (
+    tester,
+  ) async {
+    final p = Profile();
+    var earned = false;
+    await tester.pumpWidget(
+      OrbitApp(
+        profile: p,
+        commerce: CommerceHooks(rewardedStageSkip: () async => earned),
+      ),
+    );
+    final game = tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((paint) => paint.painter)
+        .whereType<OrbitPainter>()
+        .single
+        .game;
+    game.phase = Phase.lost;
+    game.campaignRetries = 6;
+    game.updateHud();
+    await tester.pump();
+    final skip = find.text('WATCH AD · SKIP STAGE');
+    expect(skip, findsNothing);
+    game.campaignRetries = 7;
+    game.updateHud();
+    await tester.pump();
+    expect(find.text('RETRY STAGE'), findsOneWidget);
+    await tester.tap(skip);
+    await tester.pump();
+    expect(game.level, 1);
+    expect(p.unlocked, 1);
+    earned = true;
+    await tester.tap(skip);
+    await tester.pump();
+    expect(game.level, 2);
+    expect(game.phase, Phase.playing);
+    expect(p.stars[1], isNull);
+    await tester.pumpWidget(const SizedBox());
+    await p.save();
+  });
+
+  test('stage skips persist for a UTC day and never count as clears', () async {
+    final p = await profile();
+    p.unlocked = 3;
+    p.gems = 20;
+    final day = DateTime.utc(2026, 11, 21);
+    expect(p.skipStage(2, day), isFalse);
+    expect(p.skipStage(3, day), isTrue);
+    expect(p.unlocked, 4);
+    expect(p.stagePrice(4), 0);
+    expect(p.stars[3], isNull);
+    expect(p.clearsTowardAd, 0);
+    expect(p.gems, 20);
+    await p.save();
+
+    final reloaded = await profile();
+    expect(reloaded.lastCampaign, 4);
+    expect(reloaded.skipStage(4, day), isFalse);
+    final nextDay = day.add(const Duration(days: 1));
+    expect(reloaded.skipStage(4, nextDay), isTrue);
+    expect(
+      reloaded.canSkipStage(5, nextDay.add(const Duration(days: 1))),
+      isFalse,
+    );
+  });
+
+  test('premium cosmetics charge once and Royal Comet requires VIP', () async {
+    final p = await profile();
+    final nova = skins.firstWhere((skin) => skin.id == 'nova');
+    final royal = skins.firstWhere((skin) => skin.id == 'royal');
+    p.gems = 3000;
+    expect(p.equipArrow(royal), isFalse);
+    expect(p.equipArrow(nova), isTrue);
+    expect(p.equipWheel(WheelSkin.singularity), isTrue);
+    expect(p.gems, 0);
+    await p.save();
+    final reloaded = await profile();
+    expect(reloaded.equipped, nova.id);
+    expect(reloaded.equipArrow(nova), isTrue);
+    expect(reloaded.equippedWheel, WheelSkin.singularity);
+    expect(reloaded.equipWheel(WheelSkin.singularity), isTrue);
+    reloaded.applyProducts({vipProduct});
+    expect(reloaded.equipArrow(royal), isTrue);
+    expect(reloaded.gems, 0);
+    reloaded.applyProducts({});
+    expect(reloaded.equipped, 'cyber');
+    await reloaded.save();
+  });
+
+  testWidgets('main gem ad rewards only completed ads and caps daily claims', (
+    tester,
+  ) async {
+    final p = Profile();
+    var earned = false;
+    var requests = 0;
+    await tester.pumpWidget(
+      OrbitApp(
+        profile: p,
+        commerce: CommerceHooks(
+          rewardedGems: () async {
+            requests++;
+            return earned;
+          },
+        ),
+      ),
+    );
+    final button = find.text('WATCH AD · +25 GEMS');
+    expect(find.text('10 left today'), findsOneWidget);
+    await tester.tap(button);
+    await tester.pump();
+    expect(p.gems, 0);
+    earned = true;
+    for (var claim = 1; claim <= 10; claim++) {
+      await tester.tap(button);
+      await tester.pump();
+      expect(p.gems, claim * 25);
+      expect(find.text('+25'), findsOneWidget);
+      expect(find.text('${p.gems} 💎'), findsOneWidget);
+    }
+    expect(requests, 11);
+    expect(button, findsNothing);
+    expect(find.text('DAILY GEM LIMIT REACHED'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    await p.save();
+    final reloaded = await profile();
+    expect(reloaded.gems, 250);
+    expect(reloaded.gemClaimsLeft(DateTime.now()), 0);
   });
 
   testWidgets('responsive UI, spacebar, pause, armory, stage grid and store', (

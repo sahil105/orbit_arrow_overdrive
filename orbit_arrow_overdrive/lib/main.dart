@@ -10,10 +10,13 @@ import 'dart:math' as math;
 // ignore: deprecated_member_use
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart'
-    show kIsWeb, defaultTargetPlatform, TargetPlatform;
+    show kDebugMode, kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'play_vip_billing.dart';
 
 const tau = math.pi * 2;
 const ink = Color(0xFF080D1B);
@@ -44,11 +47,156 @@ const orbitTestEdition = bool.fromEnvironment('ORBIT_TEST_EDITION');
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final profile = Profile(testEdition: orbitTestEdition);
+  final loaded = profile.load();
+  final standardAndroid =
+      !kIsWeb &&
+      !orbitTestEdition &&
+      defaultTargetPlatform == TargetPlatform.android;
+  final billing = standardAndroid
+      ? PlayVipBilling(vipProduct, (owned) async {
+          await loaded;
+          if (profile.vip != owned) {
+            await profile.applyProducts(owned ? {vipProduct} : {});
+          }
+        })
+      : null;
+  if (billing != null) {
+    unawaited(
+      loaded.then((_) async {
+        try {
+          await billing.restore();
+        } catch (_) {
+          // Keep cached ownership when Play is temporarily unavailable.
+        }
+      }),
+    );
+  }
   final startup = Future.wait<void>([
-    profile.load(),
+    loaded,
     Future<void>.delayed(const Duration(milliseconds: 850)),
   ]);
-  runApp(OrbitApp(profile: profile, startup: startup));
+  final useAndroidQaAds = kDebugMode && standardAndroid;
+  runApp(
+    OrbitApp(
+      profile: profile,
+      startup: startup,
+      commerce: CommerceHooks(
+        purchase: billing?.purchase ?? CommerceHooks.unavailablePurchase,
+        restore: billing?.restore ?? CommerceHooks.unavailableRestore,
+        vipPrice: billing?.price,
+        campaignAd: useAndroidQaAds ? showInterstitial : null,
+        rewardedGems: useAndroidQaAds
+            ? () => showRewardedAd(gemRewardAdUnitId)
+            : null,
+        rewardedContinue: useAndroidQaAds
+            ? () => showRewardedAd(endlessRewardedAdUnitId)
+            : CommerceHooks.unavailableAd,
+        rewardedStageSkip: useAndroidQaAds
+            ? () => showRewardedAd(stageSkipRewardedAdUnitId)
+            : null,
+      ),
+    ),
+  );
+}
+
+Future<bool> showInterstitial() async {
+  final result = Completer<bool>();
+
+  void fail(Object error) {
+    if (result.isCompleted) return;
+    debugPrint('Interstitial ad: $error');
+    result.complete(false);
+  }
+
+  try {
+    await MobileAds.instance.initialize();
+    await InterstitialAd.load(
+      adUnitId: 'ca-app-pub-6100694034284720/3165958961',
+      request: const AdRequest(),
+      adLoadCallback: InterstitialAdLoadCallback(
+        onAdLoaded: (ad) async {
+          ad.fullScreenContentCallback = FullScreenContentCallback(
+            onAdDismissedFullScreenContent: (ad) {
+              unawaited(ad.dispose());
+              if (!result.isCompleted) result.complete(true);
+            },
+            onAdFailedToShowFullScreenContent: (ad, error) {
+              unawaited(ad.dispose());
+              fail(error);
+            },
+          );
+          try {
+            await ad.show();
+          } catch (error) {
+            unawaited(ad.dispose());
+            fail(error);
+          }
+        },
+        onAdFailedToLoad: fail,
+      ),
+    );
+  } catch (error) {
+    fail(error);
+  }
+  return result.future;
+}
+
+const androidRewardedTestUnit = 'ca-app-pub-3940256099942544/5224354917';
+const gemRewardAdUnitId = String.fromEnvironment(
+  'ORBIT_ANDROID_GEM_REWARD_AD_UNIT_ID',
+  defaultValue: androidRewardedTestUnit,
+);
+const rewardedGemAmount = 25;
+const dailyGemRewardLimit = 10;
+const endlessRewardedAdUnitId = String.fromEnvironment(
+  'ORBIT_ANDROID_ENDLESS_REWARDED_AD_UNIT_ID',
+  defaultValue: androidRewardedTestUnit,
+);
+const stageSkipRewardedAdUnitId = String.fromEnvironment(
+  'ORBIT_ANDROID_STAGE_SKIP_REWARDED_AD_UNIT_ID',
+  defaultValue: androidRewardedTestUnit,
+);
+
+Future<bool> showRewardedAd(String adUnitId) async {
+  final result = Completer<bool>();
+
+  void fail(Object error) {
+    debugPrint('Rewarded ad: $error');
+    if (!result.isCompleted) result.complete(false);
+  }
+
+  try {
+    await MobileAds.instance.initialize();
+    await RewardedAd.load(
+      adUnitId: adUnitId,
+      request: const AdRequest(),
+      rewardedAdLoadCallback: RewardedAdLoadCallback(
+        onAdLoaded: (ad) async {
+          var earned = false;
+          ad.fullScreenContentCallback = FullScreenContentCallback(
+            onAdDismissedFullScreenContent: (ad) {
+              unawaited(ad.dispose());
+              if (!result.isCompleted) result.complete(earned);
+            },
+            onAdFailedToShowFullScreenContent: (ad, error) {
+              unawaited(ad.dispose());
+              fail(error);
+            },
+          );
+          try {
+            await ad.show(onUserEarnedReward: (_, _) => earned = true);
+          } catch (error) {
+            unawaited(ad.dispose());
+            fail(error);
+          }
+        },
+        onAdFailedToLoad: fail,
+      ),
+    );
+  } catch (error) {
+    fail(error);
+  }
+  return result.future;
 }
 
 // Verified entitlements only: the default callbacks cannot charge or grant items.
@@ -58,14 +206,18 @@ Future<void> main() async {
 class CommerceHooks {
   final Future<bool> Function(String productId) purchase;
   final Future<Set<String>> Function() restore;
+  final Future<String?> Function()? vipPrice;
   final Future<bool> Function() rewardedContinue;
   final Future<bool> Function()? rewardedGems;
+  final Future<bool> Function()? rewardedStageSkip;
   final Future<bool> Function()? campaignAd;
   const CommerceHooks({
     this.purchase = unavailablePurchase,
     this.restore = unavailableRestore,
+    this.vipPrice,
     this.rewardedContinue = unavailableAd,
     this.rewardedGems,
+    this.rewardedStageSkip,
     this.campaignAd,
   });
   static Future<bool> unavailablePurchase(String _) async => false;
@@ -121,6 +273,26 @@ class Profile extends ChangeNotifier {
     return true;
   }
 
+  String _stageSkipDay = '';
+
+  bool canSkipStage(int level, DateTime now) =>
+      !fullAccess &&
+      level == unlocked &&
+      level >= 1 &&
+      level < 250 &&
+      level % 5 != 0 &&
+      _stageSkipDay != now.toUtc().toIso8601String().substring(0, 10);
+
+  bool skipStage(int level, DateTime now) {
+    if (!canSkipStage(level, now)) return false;
+    _stageSkipDay = now.toUtc().toIso8601String().substring(0, 10);
+    unlocked = level + 1;
+    enteredThrough = math.max(enteredThrough, unlocked);
+    lastCampaign = unlocked;
+    unawaited(save());
+    return true;
+  }
+
   bool get campaignAdDue => !fullAccess && clearsTowardAd >= 2;
 
   void recordCampaignClear(int level) {
@@ -157,8 +329,8 @@ class Profile extends ChangeNotifier {
 
   int gemClaimsLeft(DateTime now) =>
       _gemDay == now.toUtc().toIso8601String().substring(0, 10)
-      ? 3 - _gemClaims
-      : 3;
+      ? dailyGemRewardLimit - _gemClaims
+      : dailyGemRewardLimit;
 
   bool grantRewardedGems(DateTime now) {
     if (gemClaimsLeft(now) <= 0) return false;
@@ -168,7 +340,7 @@ class Profile extends ChangeNotifier {
       _gemClaims = 0;
     }
     _gemClaims++;
-    gems += 25;
+    gems += rewardedGemAmount;
     unawaited(save());
     return true;
   }
@@ -194,6 +366,9 @@ class Profile extends ChangeNotifier {
       ).clamp(1, 250);
       lastCampaign = integer('lastCampaign', enteredThrough, 250).clamp(1, 250);
       clearsTowardAd = integer('clearsTowardAd', 0, 2);
+      _stageSkipDay = d['stageSkipDay'] is String
+          ? d['stageSkipDay'] as String
+          : '';
       gems = integer('gems', 0, 1000000000);
       bestWave = integer('bestWave', 0, 1000000000);
       bestScore = integer('bestScore', 0, 1000000000);
@@ -208,7 +383,7 @@ class Profile extends ChangeNotifier {
         if (wheel.name == d['equippedWheel']) equippedWheel = wheel;
       }
       _gemDay = d['gemRewardDay'] is String ? d['gemRewardDay'] as String : '';
-      _gemClaims = integer('gemRewardClaims', 0, 3);
+      _gemClaims = integer('gemRewardClaims', 0, dailyGemRewardLimit);
       pack1 = d['pack1'] == true;
       pack2 = d['pack2'] == true;
       haptics = d['haptics'] != false;
@@ -246,6 +421,7 @@ class Profile extends ChangeNotifier {
       'enteredThrough': enteredThrough,
       'lastCampaign': lastCampaign,
       'clearsTowardAd': clearsTowardAd,
+      'stageSkipDay': _stageSkipDay,
       'gems': gems,
       'ownedWheels': ownedWheels.map((wheel) => wheel.name).toList(),
       'equippedWheel': equippedWheel.name,
@@ -277,7 +453,7 @@ class Profile extends ChangeNotifier {
     return _writes;
   }
 
-  void applyProducts(Set<String> products) {
+  Future<void> applyProducts(Set<String> products) {
     vip = products.contains(vipProduct);
     if (!fullAccess) {
       if (!owned.contains(equipped)) equipped = 'cyber';
@@ -285,7 +461,7 @@ class Profile extends ChangeNotifier {
         equippedWheel = WheelSkin.classic;
       }
     }
-    unawaited(save());
+    return save();
   }
 }
 
@@ -294,7 +470,9 @@ enum WheelSkin {
   solar('Solar Forge', 100, Color(0xFFFFAE57), 6),
   tidal('Tidal Circuit', 240, Color(0xFF63FFDB), 8),
   eclipse('Violet Eclipse', 480, Color(0xFFD69DFF), 3),
-  prism('Prism Reactor', 850, Color(0xFFFF79BD), 5);
+  prism('Prism Reactor', 850, Color(0xFFFF79BD), 5),
+  aurora('Aurora Crown', 1100, Color(0xFF85FFAD), 12),
+  singularity('Singularity', 1500, Color(0xFFB393FF), 16);
 
   const WheelSkin(this.label, this.price, this.tint, this.segments);
   final String label;
@@ -325,6 +503,10 @@ const skins = [
   Skin('saw', 'Sawblade Trophy', Color(0xFFFF96C0), 0, 4, 'Clear stage 5'),
   Skin('chrono', 'Chrono Void', Color(0xFFAD91FF), 0, 5, 'Clear stage 10'),
   Skin('omega', 'Omega Sovereign', gold, 0, 6, 'Clear stage 250 or VIP'),
+  Skin('frost', 'Frost Lance', Color(0xFF91DDFF), 750, 7, '750 gems'),
+  Skin('plasma', 'Plasma Trident', Color(0xFFFF7EB6), 1100, 8, '1100 gems'),
+  Skin('nova', 'Nova Crescent', Color(0xFFFFA75D), 1500, 9, '1500 gems'),
+  Skin('royal', 'Royal Comet', Color(0xFFFFE888), 0, 10, 'VIP exclusive'),
 ];
 
 enum Motion { constant, pulse, reverse, staccato }
@@ -417,7 +599,9 @@ class OrbitGame extends ChangeNotifier {
       !endless && level == stage && phase == Phase.lost;
 
   bool retryAdDue(int stage) =>
-      !profile.fullAccess && isCampaignRetry(stage) && campaignRetries >= 3;
+      !profile.fullAccess &&
+      isCampaignRetry(stage) &&
+      (campaignRetries + 1) % 4 == 0;
 
   late Stage stage;
   int level = 1, wave = 1, hearts = 3, score = 0, remaining = 6;
@@ -784,11 +968,17 @@ class OrbitGame extends ChangeNotifier {
     }
   }
 
-  Future<void> _playAndroidSound(String cue) async {
+  void stopSound() {
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      unawaited(_playAndroidSound(null));
+    }
+  }
+
+  Future<void> _playAndroidSound(String? cue) async {
     try {
       await const MethodChannel(
         'orbit_arrow/sound',
-      ).invokeMethod<void>('play', cue);
+      ).invokeMethod<void>(cue == null ? 'stop' : 'play', cue);
     } on MissingPluginException {
       // Sound is an optional Android integration.
     } on PlatformException {
@@ -797,12 +987,25 @@ class OrbitGame extends ChangeNotifier {
   }
 
   void _haptic({bool heavy = false}) {
-    if (!profile.haptics) return;
-    // Haptics are optional and never part of the simulation's success path.
-    unawaited(
-      (heavy ? HapticFeedback.heavyImpact() : HapticFeedback.selectionClick())
-          .catchError((Object _) {}),
-    );
+    if (profile.haptics && !kIsWeb) unawaited(_playHaptic(heavy));
+  }
+
+  Future<void> _playHaptic(bool heavy) async {
+    try {
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        await const MethodChannel(
+          'orbit_arrow/haptics',
+        ).invokeMethod<void>('pulse', heavy);
+      } else {
+        await (heavy
+            ? HapticFeedback.heavyImpact()
+            : HapticFeedback.selectionClick());
+      }
+    } on MissingPluginException {
+      // Keep feedback optional on platforms without haptics.
+    } on PlatformException {
+      // Vibrator availability never affects gameplay.
+    }
   }
 
   void _burst(Offset p, Color color, int count, {bool electric = false}) {
@@ -1042,6 +1245,7 @@ class _GameScreenState extends State<GameScreen>
   late final Ticker ticker;
   final FocusNode keyboard = FocusNode(debugLabel: 'Orbit controls');
   bool modal = false, manualPause = false, busy = false;
+  Key? _gemRewardAnimation;
   Profile get profile => widget.profile;
   @override
   void initState() {
@@ -1092,7 +1296,7 @@ class _GameScreenState extends State<GameScreen>
     String title,
     Widget Function(BuildContext, StateSetter) content,
   ) async {
-    if (modal) return;
+    if (modal || busy) return;
     modal = true;
     game.paused = true;
     await showDialog<void>(
@@ -1139,15 +1343,12 @@ class _GameScreenState extends State<GameScreen>
           builder: (context, _) => Column(
             children: [
               Text('${profile.gems} 💎', style: const TextStyle(color: gold)),
-              if (!profile.fullAccess && widget.commerce.rewardedGems != null)
-                TextButton(
-                  onPressed: busy || profile.gemClaimsLeft(DateTime.now()) <= 0
-                      ? null
-                      : () => claimArmoryGems(context, update),
-                  child: Text(
-                    profile.gemClaimsLeft(DateTime.now()) <= 0
-                        ? 'DAILY GEM LIMIT REACHED'
-                        : 'WATCH AD · +25 GEMS',
+              if (canOfferGemAd)
+                gemAdButton(
+                  () => claimRewardedGems(
+                    refresh: () {
+                      if (context.mounted) update(() {});
+                    },
                   ),
                 ),
               const TabBar(
@@ -1164,7 +1365,9 @@ class _GameScreenState extends State<GameScreen>
                         for (final skin in skins)
                           _armoryItem(
                             name: skin.name,
-                            hint: skin.unlock,
+                            hint: profile.ownsArrow(skin)
+                                ? 'Owned'
+                                : skin.unlock,
                             color: skin.color,
                             preview: CustomPaint(
                               size: const Size(36, 48),
@@ -1176,6 +1379,8 @@ class _GameScreenState extends State<GameScreen>
                                 ? 'EQUIP'
                                 : skin.price > 0
                                 ? '${skin.price} 💎'
+                                : skin.id == 'royal'
+                                ? 'VIP ONLY'
                                 : 'BOSS LOCKED',
                             action:
                                 profile.equipped == skin.id ||
@@ -1194,9 +1399,9 @@ class _GameScreenState extends State<GameScreen>
                         for (final wheel in WheelSkin.values)
                           _armoryItem(
                             name: wheel.label,
-                            hint: wheel == WheelSkin.classic
-                                ? 'Starter wheel'
-                                : 'Cosmetic wheel',
+                            hint: profile.ownsWheel(wheel)
+                                ? 'Owned'
+                                : '${wheel.price} gems',
                             color: wheel.tint,
                             preview: CustomPaint(
                               size: const Size.square(48),
@@ -1276,114 +1481,233 @@ class _GameScreenState extends State<GameScreen>
     ),
   );
 
-  Future<void> claimArmoryGems(BuildContext context, StateSetter update) async {
+  bool get canOfferGemAd =>
+      !profile.fullAccess && widget.commerce.rewardedGems != null;
+
+  Widget gemAdButton(VoidCallback onPressed) {
+    final remaining = profile.gemClaimsLeft(DateTime.now());
+    return TextButton(
+      onPressed: busy || remaining <= 0 ? null : onPressed,
+      child: Text(
+        remaining <= 0
+            ? 'DAILY GEM LIMIT REACHED'
+            : 'WATCH AD · +$rewardedGemAmount GEMS',
+        style: const TextStyle(fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget gemBalance() => Stack(
+    clipBehavior: Clip.none,
+    children: [
+      Text(
+        '${profile.gems} 💎',
+        style: const TextStyle(color: gold, fontWeight: FontWeight.w800),
+      ),
+      if (_gemRewardAnimation != null && !manualPause)
+        Positioned(
+          top: 14,
+          right: 0,
+          child: IgnorePointer(
+            child: TweenAnimationBuilder<double>(
+              key: _gemRewardAnimation,
+              onEnd: () => setState(() => _gemRewardAnimation = null),
+              tween: Tween(begin: 0.0, end: 1.0),
+              duration: const Duration(milliseconds: 1000),
+              builder: (context, progress, child) => Transform.translate(
+                offset: Offset(0, 12 * (1 - progress)),
+                child: Opacity(
+                  opacity: (1 - progress).clamp(0.0, 1.0),
+                  child: child,
+                ),
+              ),
+              child: const Text(
+                '+$rewardedGemAmount',
+                style: TextStyle(color: gold, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ),
+    ],
+  );
+
+  Future<void> claimRewardedGems({VoidCallback? refresh}) async {
     final showAd = widget.commerce.rewardedGems;
     if (busy ||
-        profile.fullAccess ||
         showAd == null ||
+        !canOfferGemAd ||
         profile.gemClaimsLeft(DateTime.now()) <= 0) {
       return;
     }
-    busy = true;
-    update(() {});
+    setState(() => busy = true);
+    refresh?.call();
     try {
       if (await showAd()) {
-        profile.grantRewardedGems(DateTime.now());
+        if (profile.grantRewardedGems(DateTime.now()) && mounted) {
+          setState(() => _gemRewardAnimation = UniqueKey());
+          message('+$rewardedGemAmount gems added!');
+        }
       } else if (mounted) {
         message('Ad unavailable or incomplete. Try again shortly.');
       }
     } catch (_) {
       if (mounted) message('Ad unavailable. Try again shortly.');
     } finally {
-      busy = false;
-      if (context.mounted) update(() {});
+      if (mounted) {
+        setState(() => busy = false);
+        refresh?.call();
+      }
     }
   }
 
-  Future<void> store() => sheet(
-    profile.testEdition ? 'ORBIT ARROW TEST' : 'VIP PASS',
-    (context, update) => SingleChildScrollView(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            profile.testEdition
-                ? 'Test edition · all 250 stages and all skins are unlocked.'
-                : 'One-time ₹50 VIP pass',
-          ),
-          const SizedBox(height: 12),
-          const Text(
-            'All 250 stages open · every arrow and wheel skin · no entry fees · no ads',
-          ),
-          const SizedBox(height: 12),
-          FilledButton(
-            onPressed: busy || profile.fullAccess
-                ? null
-                : () async {
-                    busy = true;
-                    update(() {});
-                    try {
-                      if (await widget.commerce.purchase(vipProduct)) {
-                        profile.applyProducts({vipProduct});
-                        message('VIP unlocked.');
-                      } else {
-                        message('VIP checkout is unavailable in this build.');
-                      }
-                    } catch (_) {
-                      message('Purchase could not be completed.');
-                    } finally {
-                      busy = false;
-                      if (context.mounted) update(() {});
-                    }
-                  },
-            child: Text(
+  Future<void> store() {
+    final price = profile.fullAccess ? null : widget.commerce.vipPrice?.call();
+    return sheet(
+      profile.testEdition ? 'ORBIT ARROW TEST' : 'VIP PASS',
+      (context, update) => SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
               profile.testEdition
-                  ? 'TEST ACCESS ACTIVE'
-                  : profile.vip
-                  ? 'VIP ACTIVE'
-                  : 'BUY VIP · ₹50',
+                  ? 'Test edition · all 250 stages and all skins are unlocked.'
+                  : 'One-time VIP pass',
             ),
-          ),
-          if (!profile.testEdition)
-            TextButton(
-              onPressed: busy
+            const SizedBox(height: 12),
+            const Text(
+              'All 250 stages open · every arrow and wheel skin, including Royal Comet · no entry fees · no ads',
+            ),
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: busy || profile.fullAccess
                   ? null
                   : () async {
                       busy = true;
                       update(() {});
                       try {
-                        final restored = await widget.commerce.restore();
-                        if (restored.contains(vipProduct)) {
-                          profile.applyProducts(restored);
-                          message('VIP restored.');
+                        if (await widget.commerce.purchase(vipProduct)) {
+                          if (!profile.vip) {
+                            await profile.applyProducts({vipProduct});
+                          }
+                          message('VIP unlocked.');
                         } else {
-                          message('No VIP purchase could be restored.');
+                          message(
+                            'VIP purchase was not completed. If payment is pending, access unlocks after Google Play confirms it.',
+                          );
                         }
                       } catch (_) {
-                        message('Restore is unavailable. Try again later.');
+                        message('Purchase could not be completed.');
                       } finally {
                         busy = false;
                         if (context.mounted) update(() {});
                       }
                     },
-              child: const Text('RESTORE VIP'),
+              child: FutureBuilder<String?>(
+                future: price,
+                builder: (_, snapshot) => Text(
+                  profile.testEdition
+                      ? 'TEST ACCESS ACTIVE'
+                      : profile.vip
+                      ? 'VIP ACTIVE'
+                      : snapshot.data == null
+                      ? 'BUY VIP'
+                      : 'BUY VIP · ${snapshot.data}',
+                ),
+              ),
             ),
-        ],
+            if (!profile.testEdition)
+              TextButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        busy = true;
+                        update(() {});
+                        try {
+                          final restored = await widget.commerce.restore();
+                          if (restored.contains(vipProduct)) {
+                            if (!profile.vip) {
+                              await profile.applyProducts(restored);
+                            }
+                            message('VIP restored.');
+                          } else {
+                            message('No VIP purchase could be restored.');
+                          }
+                        } catch (_) {
+                          message('Restore is unavailable. Try again later.');
+                        } finally {
+                          busy = false;
+                          if (context.mounted) update(() {});
+                        }
+                      },
+                child: const Text('RESTORE VIP'),
+              ),
+          ],
+        ),
       ),
-    ),
-  );
+    );
+  }
+
+  bool get stageSkipOffered =>
+      widget.commerce.rewardedStageSkip != null &&
+      game.isCampaignRetry(game.level) &&
+      game.campaignRetries >= 7 &&
+      profile.canSkipStage(game.level, DateTime.now());
+
+  Future<void> watchAdToSkipStage() async {
+    final showAd = widget.commerce.rewardedStageSkip;
+    if (busy || modal || showAd == null || !stageSkipOffered) {
+      return;
+    }
+    final level = game.level;
+    setState(() => busy = true);
+    try {
+      final earned = await showAd();
+      if (!mounted) return;
+      if (earned) _lastCampaignAd = DateTime.now();
+      if (earned &&
+          game.isCampaignRetry(level) &&
+          profile.skipStage(level, DateTime.now())) {
+        game.startCampaign(level + 1);
+      } else {
+        message('No skip earned. You can retry this stage.');
+      }
+    } catch (_) {
+      if (mounted) message('Ad unavailable. You can retry this stage.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  static const campaignAdCooldown = Duration(seconds: 90);
+  DateTime? _lastCampaignAd;
+
+  bool get campaignAdReady {
+    final lastAd = _lastCampaignAd;
+    return lastAd == null ||
+        DateTime.now().difference(lastAd) >= campaignAdCooldown;
+  }
+
+  bool shouldShowRetryAd(int stage) =>
+      game.retryAdDue(stage) &&
+      campaignAdReady &&
+      !(game.campaignRetries == 7 && stageSkipOffered);
 
   Future<void> openStage(int stage) async {
-    if (busy || modal || !profile.canSelectStage(stage)) return;
+    if (busy || modal || !profile.canSelectStage(stage)) {
+      return;
+    }
     final price = profile.stagePrice(stage);
     if (profile.gems < price) {
       message('You need 5 gems. Replay a stage or play Endless to earn more.');
       return;
     }
-    final retryAd = game.retryAdDue(stage);
+    final retryAd = shouldShowRetryAd(stage);
     final progressionAd =
-        !game.endless && stage > game.level && profile.campaignAdDue;
+        !game.endless &&
+        stage > game.level &&
+        profile.campaignAdDue &&
+        campaignAdReady;
     if (retryAd || progressionAd) {
       setState(() => busy = true);
       try {
@@ -1402,7 +1726,7 @@ class _GameScreenState extends State<GameScreen>
                 builder: (dialogContext) => AlertDialog(
                   title: const Text('Orbit Arrow VIP'),
                   content: const Text(
-                    'Orbit Arrow promotion · Unlock all stages and skins and remove ads with the ₹50 VIP pass.',
+                    'Orbit Arrow promotion · Unlock all stages and skins and remove ads with the VIP pass.',
                   ),
                   actions: [
                     FilledButton(
@@ -1416,7 +1740,10 @@ class _GameScreenState extends State<GameScreen>
               ) ??
               true;
         }
-        if (shown && progressionAd) profile.recordCampaignAd();
+        if (shown) {
+          _lastCampaignAd = DateTime.now();
+          if (progressionAd) profile.recordCampaignAd();
+        }
       } finally {
         if (mounted) setState(() => busy = false);
       }
@@ -1504,7 +1831,9 @@ class _GameScreenState extends State<GameScreen>
   }
 
   Future<void> rewardedContinue() async {
-    if (busy || (game.continued && !profile.testEdition)) return;
+    if (busy || (game.continued && !profile.testEdition)) {
+      return;
+    }
     setState(() => busy = true);
     game.paused = true;
     try {
@@ -1514,9 +1843,7 @@ class _GameScreenState extends State<GameScreen>
       if (earned) {
         game.continueEndless();
       } else {
-        message(
-          'No rewarded ad completed. Connect an ad provider to enable continues.',
-        );
+        message('No reward earned. Try again or restart survival.');
       }
     } catch (_) {
       message('Ad unavailable. You can restart survival.');
@@ -1597,13 +1924,7 @@ class _GameScreenState extends State<GameScreen>
                                 },
                               ),
                               const Spacer(),
-                              Text(
-                                '${profile.gems} 💎',
-                                style: const TextStyle(
-                                  color: gold,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
+                              gemBalance(),
                               IconButton(
                                 tooltip: 'Pause / resume (P)',
                                 onPressed: togglePause,
@@ -1614,6 +1935,26 @@ class _GameScreenState extends State<GameScreen>
                               ),
                             ],
                           ),
+                          if (canOfferGemAd)
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  gemAdButton(() {
+                                    if (!modal) claimRewardedGems();
+                                  }),
+                                  if (profile.gemClaimsLeft(DateTime.now()) > 0)
+                                    Text(
+                                      '${profile.gemClaimsLeft(DateTime.now())} left today',
+                                      style: const TextStyle(
+                                        color: Colors.white60,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
                           Row(
                             children: [
                               Text(
@@ -1697,9 +2038,13 @@ class _GameScreenState extends State<GameScreen>
                               ),
                             ),
                             const SizedBox(height: 16),
-                            const Text(
-                              'TAP / CLICK / SPACE TO LAUNCH',
-                              style: TextStyle(
+                            Text(
+                              switch (defaultTargetPlatform) {
+                                TargetPlatform.android ||
+                                TargetPlatform.iOS => 'TAP TO LAUNCH',
+                                _ => 'CLICK OR PRESS SPACE TO LAUNCH',
+                              },
+                              style: const TextStyle(
                                 color: Colors.white38,
                                 fontSize: 10,
                                 letterSpacing: 2,
@@ -1721,6 +2066,7 @@ class _GameScreenState extends State<GameScreen>
                           armory();
                         }),
                         button('∞ ENDLESS', () {
+                          if (busy) return;
                           setState(() {
                             manualPause = false;
                             game.paused = false;
@@ -1738,7 +2084,11 @@ class _GameScreenState extends State<GameScreen>
                                 : 'Enable sound',
                             onPressed: () {
                               setState(() => profile.sound = !profile.sound);
-                              if (profile.sound) game.playSound('hit');
+                              if (profile.sound) {
+                                game.playSound('hit');
+                              } else {
+                                game.stopSound();
+                              }
                               unawaited(profile.save());
                             },
                             icon: Icon(
@@ -1748,20 +2098,28 @@ class _GameScreenState extends State<GameScreen>
                               size: 18,
                             ),
                           ),
-                        IconButton(
-                          tooltip: 'Toggle haptics',
-                          onPressed: () {
-                            setState(() => profile.haptics = !profile.haptics);
-                            unawaited(profile.save());
-                          },
-                          icon: Icon(
-                            profile.haptics
-                                ? Icons.vibration
-                                : Icons.phone_android,
-                            size: 18,
-                            color: Colors.white38,
+                        if (!kIsWeb &&
+                            (defaultTargetPlatform == TargetPlatform.android ||
+                                defaultTargetPlatform == TargetPlatform.iOS))
+                          IconButton(
+                            tooltip: profile.haptics
+                                ? 'Turn vibration off'
+                                : 'Turn vibration on',
+                            onPressed: () {
+                              setState(
+                                () => profile.haptics = !profile.haptics,
+                              );
+                              game._haptic(heavy: true);
+                              unawaited(profile.save());
+                            },
+                            icon: Icon(
+                              profile.haptics
+                                  ? Icons.vibration
+                                  : Icons.phone_android,
+                              size: 18,
+                              color: profile.haptics ? cyan : Colors.white38,
+                            ),
                           ),
-                        ),
                       ],
                     ),
                   ),
@@ -1859,34 +2217,45 @@ class _GameScreenState extends State<GameScreen>
                                       'REPLAY FOR STARS',
                                       () => game.startCampaign(game.level),
                                     ),
+                                  ] else if (game.endless) ...[
+                                    if (!game.continued || profile.testEdition)
+                                      FilledButton(
+                                        onPressed: busy
+                                            ? null
+                                            : rewardedContinue,
+                                        child: Text(
+                                          profile.fullAccess
+                                              ? 'RESTORE 3 HEARTS'
+                                              : 'WATCH AD · RESTORE 3 HEARTS',
+                                        ),
+                                      ),
+                                    OutlinedButton(
+                                      onPressed: busy
+                                          ? null
+                                          : game.startEndless,
+                                      child: const Text('RESTART RUN'),
+                                    ),
                                   ] else ...[
                                     FilledButton(
                                       onPressed: busy
                                           ? null
-                                          : () => game.endless
-                                                ? game.startEndless()
-                                                : openStage(game.level),
+                                          : () => openStage(game.level),
                                       child: Text(
-                                        game.endless
-                                            ? 'RESTART SURVIVAL'
-                                            : game.retryAdDue(game.level)
+                                        shouldShowRetryAd(game.level)
                                             ? 'RETRY · AD BREAK'
                                             : 'RETRY STAGE',
                                       ),
                                     ),
-                                    if (game.endless &&
-                                        (!game.continued ||
-                                            profile.testEdition))
-                                      button(
-                                        busy
-                                            ? 'LOADING AD…'
-                                            : profile.fullAccess
-                                            ? 'RESTORE 3 HEARTS'
-                                            : 'WATCH AD · RESTORE 3 HEARTS',
-                                        () {
-                                          rewardedContinue();
-                                        },
-                                        color: gold,
+                                    if (stageSkipOffered)
+                                      OutlinedButton(
+                                        onPressed: busy
+                                            ? null
+                                            : watchAdToSkipStage,
+                                        child: Text(
+                                          busy
+                                              ? 'LOADING AD…'
+                                              : 'WATCH AD · SKIP STAGE',
+                                        ),
                                       ),
                                   ],
                                   button('ARROW ARMORY', () {
@@ -2366,6 +2735,51 @@ void drawArrowHead(
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.5;
       c.drawCircle(Offset.zero, 6, paint);
+      break;
+    case 7:
+      path
+        ..moveTo(0, -11)
+        ..lineTo(6, 2)
+        ..lineTo(2, 8)
+        ..lineTo(0, 4)
+        ..lineTo(-2, 8)
+        ..lineTo(-6, 2)
+        ..close();
+      c.drawPath(path, paint);
+      break;
+    case 8:
+      path
+        ..moveTo(-7, -6)
+        ..lineTo(-3, -2)
+        ..lineTo(0, -10)
+        ..lineTo(3, -2)
+        ..lineTo(7, -6)
+        ..lineTo(5, 5)
+        ..lineTo(0, 8)
+        ..lineTo(-5, 5)
+        ..close();
+      c.drawPath(path, paint);
+      break;
+    case 9:
+      path
+        ..moveTo(7, -8)
+        ..quadraticBezierTo(-8, -9, -8, 1)
+        ..quadraticBezierTo(-7, 10, 7, 7)
+        ..quadraticBezierTo(-5, 2, 7, -8)
+        ..close();
+      c.drawPath(path, paint);
+      break;
+    case 10:
+      for (var i = 0; i < 8; i++) {
+        final point = radial(i * tau / 8 - math.pi / 2, i.isEven ? 10 : 3);
+        if (i == 0) {
+          path.moveTo(point.dx, point.dy);
+        } else {
+          path.lineTo(point.dx, point.dy);
+        }
+      }
+      path.close();
+      c.drawPath(path, paint);
       break;
     default:
       path

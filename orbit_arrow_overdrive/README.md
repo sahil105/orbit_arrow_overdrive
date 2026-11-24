@@ -112,7 +112,7 @@ Armory → Wheels includes Classic Orbit (free), Solar Forge (100 gems), Tidal C
 
 ### 1.4.0 Campaign economy and Test APK
 
-The first stage is free. A newly unlocked Campaign stage costs 5 gems the first time you choose it. Entries already paid for, attempts on the same stage, and ranges owned through an old stage pack remain free. After two first clears, advancing shows a skippable in-game VIP promotion when no ad provider is attached. Optional ad and checkout callbacks accept only verified provider results. The ₹50 VIP pass removes gem charges and ads, opens every stage, and enables all skins. A live ad network and verified production billing are not configured in these builds.
+The first stage is free. A newly unlocked Campaign stage costs 5 gems the first time you choose it. Entries already paid for, attempts on the same stage, and ranges owned through an old stage pack remain free. After two first clears, advancing shows a skippable in-game VIP promotion when no ad provider is attached. Optional ad and checkout callbacks accept only verified provider results. The ₹199 VIP pass removes gem charges and ads, opens every stage, and enables all skins. A live ad network and verified production billing are not configured in these builds.
 
 Orbit Arrow Test uses the separate Android application ID `dev.orbitarrow.orbit_arrow_overdrive.test`. It supports every stage and skin, has no entry fees or ads, and offers free Endless continues. To build the same variant, set `ORBIT_TEST_EDITION=true` for Gradle and run `flutter build apk --dart-define=ORBIT_TEST_EDITION=true`. For standard Android and web builds, omit both test options.
 

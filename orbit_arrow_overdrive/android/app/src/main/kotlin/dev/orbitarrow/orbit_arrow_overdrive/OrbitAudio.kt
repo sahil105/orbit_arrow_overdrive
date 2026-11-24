@@ -13,6 +13,7 @@ class OrbitAudio(activity: Activity) {
     ).build()
     private val ready = mutableSetOf<Int>()
     private var pending: Int? = null
+    private val streams = ArrayDeque<Int>()
     private val samples: Map<String, Int>
 
     init {
@@ -48,12 +49,17 @@ class OrbitAudio(activity: Activity) {
     }
 
     private fun playSample(sample: Int) {
-        pool.play(sample, .65f, .65f, 1, 0, 1f)
+        val stream = pool.play(sample, .78f, .78f, 1, 0, 1f)
+        if (stream != 0) {
+            if (streams.size == 3) streams.removeFirst()
+            streams.addLast(stream)
+        }
     }
 
-    fun pause() {
+    fun stop() {
         pending = null
-        pool.autoPause()
+        streams.forEach { pool.stop(it) }
+        streams.clear()
     }
 
     fun release() {

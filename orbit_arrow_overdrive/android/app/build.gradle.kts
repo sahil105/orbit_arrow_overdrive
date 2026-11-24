@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -5,11 +7,17 @@ plugins {
 }
 
 val orbitTestEdition = System.getenv("ORBIT_TEST_EDITION") == "true"
+val uploadPropertiesFile = rootProject.file("key.properties")
+val uploadProperties = Properties().apply {
+    if (uploadPropertiesFile.isFile) {
+        uploadPropertiesFile.inputStream().use { load(it) }
+    }
+}
 
 android {
     namespace = "dev.orbitarrow.orbit_arrow_overdrive"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "30.0.16248370"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -40,6 +48,14 @@ android {
     // Optional local test signing. Production builds require your release key.
     val orbitTestKeystore = System.getenv("ORBIT_TEST_KEYSTORE")
     signingConfigs {
+        if (!orbitTestEdition && uploadPropertiesFile.isFile) {
+            create("upload") {
+                storeFile = rootProject.file(uploadProperties.getProperty("storeFile"))
+                storePassword = uploadProperties.getProperty("storePassword")
+                keyAlias = uploadProperties.getProperty("keyAlias")
+                keyPassword = uploadProperties.getProperty("keyPassword")
+            }
+        }
         if (orbitTestKeystore != null) {
             create("orbitTest") {
                 storeFile = file(orbitTestKeystore)
@@ -54,11 +70,11 @@ android {
     }
     buildTypes {
         release {
-            if (orbitTestKeystore != null) {
+            if (!orbitTestEdition && uploadPropertiesFile.isFile) {
+                signingConfig = signingConfigs.getByName("upload")
+            } else if (orbitTestKeystore != null) {
                 signingConfig = signingConfigs.getByName("orbitTest")
             }
-            // TODO: Add your own signing config for the release build.
-            // Configure your release keystore here before distribution.
         }
     }
 }
