@@ -47,6 +47,95 @@ void main() {
     expect(Stage(151).drift, true);
     expect(Stage(1000000, endless: true).speed, lessThanOrEqualTo(5.3));
   });
+  test(
+    'campaign stage three completes a full rotation without reversing',
+    () async {
+      final p = await profile();
+      p.unlocked = 3;
+      p.gems = 5;
+      final game = OrbitGame(p)..startCampaign(3);
+      expect(game.level, 3);
+      advance(game, 4);
+      expect(game.angle, closeTo(wrap(game.stage.speed * 4), .025));
+      game.dispose();
+      await p.save();
+    },
+  );
+
+  test(
+    'campaign backup merges progress from older saves without a wallet',
+    () async {
+      final original = await profile();
+      original.unlocked = 11;
+      original.enteredThrough = 10;
+      original.stars = {3: 2, 5: 1, 10: 3};
+      original.vip = true;
+      final legacy = original.exportCampaign();
+      final restored = Profile()..stars[3] = 3;
+      expect(await restored.restoreCampaign(legacy), isTrue);
+      expect(restored.canSelectStage(11), isTrue);
+      expect(restored.canSelectStage(12), isFalse);
+      expect(restored.stagePrice(10), 0);
+      expect(restored.stars, {3: 3, 5: 1, 10: 3});
+      expect(restored.owned, containsAll(['saw', 'chrono']));
+      expect(restored.vip, isFalse);
+      expect(restored.gems, 0);
+      await expectLater(restored.restoreCampaign('{}'), throwsFormatException);
+      expect((await profile()).unlocked, 11);
+    },
+  );
+
+  test(
+    'wallet restores the latest balance including a spend to zero',
+    () async {
+      final original = await profile();
+      original.gems = 35;
+      await original.save();
+      final beforeSpend = original.exportCampaign();
+      final wiped = Profile();
+      expect(await wiped.restoreCampaign(beforeSpend), isTrue);
+      expect(wiped.gems, 35);
+
+      original.gems = 0;
+      await original.save();
+      final afterSpend = original.exportCampaign();
+      expect(await wiped.restoreCampaign(afterSpend), isTrue);
+      expect(await wiped.restoreCampaign(beforeSpend), isTrue);
+      expect(wiped.gems, 0);
+      expect((await profile()).exportCampaign(), afterSpend);
+    },
+  );
+
+  test('late cloud restore resumes a wiped campaign before play', () async {
+    final p = await profile();
+    final game = OrbitGame(p);
+    addTearDown(game.dispose);
+    expect(game.level, 1);
+
+    final backup = Profile()
+      ..unlocked = 11
+      ..enteredThrough = 10
+      ..stars = {10: 3};
+    expect(await p.restoreCampaign(backup.exportCampaign()), isTrue);
+    expect(game.level, 11);
+    expect(p.stars[10], 3);
+    expect(p.canSelectStage(11), isTrue);
+    expect((await profile()).lastCampaign, 11);
+  });
+
+  test('a restored Stage 1 win resumes Stage 2 without gems', () async {
+    final p = await profile();
+    final game = OrbitGame(p);
+    addTearDown(game.dispose);
+    final backup = Profile()
+      ..unlocked = 2
+      ..stars = {1: 3};
+    expect(await p.restoreCampaign(backup.exportCampaign()), isTrue);
+    expect(p.gems, 0);
+    expect(p.stagePrice(2), 0);
+    expect(game.level, 2);
+  });
+
   test('motion is consistent at 30/60/120 Hz', () async {
     final p = await profile();
     p.unlocked = 250;
@@ -105,9 +194,11 @@ void main() {
       expect(p.campaignAdDue, isTrue);
       p.applyProducts({vipProduct});
       expect(p.campaignAdDue, isFalse);
-      expect(p.enterStage(250), isTrue);
+      expect(p.enterStage(250), isFalse);
+      p.unlocked = 3;
+      expect(p.enterStage(3), isTrue);
       expect(p.equipArrow(skins.last), isTrue);
-      expect(p.equipWheel(WheelSkin.prism), isTrue);
+      expect(p.equipWheel(WheelSkin.prism), isFalse);
       expect(p.gems, 0);
 
       final sandbox = Profile(testEdition: true)..clearsTowardAd = 2;
@@ -477,6 +568,8 @@ void main() {
     }
     p.vip = true;
     expect(game.retryAdDue(1), isFalse);
+    expect(game.startCampaign(2), isFalse);
+    p.unlocked = 2;
     expect(game.startCampaign(2), isTrue);
     expect(game.campaignRetries, 0);
     await tester.pumpWidget(const SizedBox());
@@ -605,6 +698,9 @@ void main() {
     expect(reloaded.equipWheel(WheelSkin.singularity), isTrue);
     reloaded.applyProducts({vipProduct});
     expect(reloaded.equipArrow(royal), isTrue);
+    expect(reloaded.equipWheel(WheelSkin.solar), isFalse);
+    reloaded.gems = WheelSkin.solar.price;
+    expect(reloaded.equipWheel(WheelSkin.solar), isTrue);
     expect(reloaded.gems, 0);
     reloaded.applyProducts({});
     expect(reloaded.equipped, 'cyber');

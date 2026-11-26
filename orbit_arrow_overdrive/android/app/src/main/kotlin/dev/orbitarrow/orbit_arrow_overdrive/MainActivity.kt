@@ -13,6 +13,7 @@ class MainActivity : FlutterActivity() {
     private var audio: OrbitAudio? = null
     private var soundChannel: MethodChannel? = null
     private var hapticsChannel: MethodChannel? = null
+    private var cloudSave: CampaignCloudSave? = null
     private var audioUnavailable = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -53,6 +54,8 @@ class MainActivity : FlutterActivity() {
                 result.notImplemented()
             }
         }
+
+        cloudSave = CampaignCloudSave(this, flutterEngine.dartExecutor.binaryMessenger)
     }
 
     @Suppress("DEPRECATION")
@@ -83,6 +86,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        cloudSave?.close()
+        cloudSave = null
         soundChannel?.setMethodCallHandler(null)
         soundChannel = null
         hapticsChannel?.setMethodCallHandler(null)

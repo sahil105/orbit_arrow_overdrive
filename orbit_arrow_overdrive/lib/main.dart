@@ -43,6 +43,8 @@ Offset radial(double angle, double radius) =>
     Offset(math.cos(angle), math.sin(angle)) * radius;
 
 const orbitTestEdition = bool.fromEnvironment('ORBIT_TEST_EDITION');
+const orbitClosedTestAds = bool.fromEnvironment('ORBIT_CLOSED_TEST_ADS');
+const orbitAdsTestApk = bool.fromEnvironment('ORBIT_ADS_TEST_APK');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -52,7 +54,10 @@ Future<void> main() async {
       !kIsWeb &&
       !orbitTestEdition &&
       defaultTargetPlatform == TargetPlatform.android;
-  final billing = standardAndroid
+  final cloudStartup = standardAndroid && !orbitAdsTestApk
+      ? loaded.then((_) => CampaignCloudSync(profile).start())
+      : Future<void>.value();
+  final billing = standardAndroid && !orbitAdsTestApk
       ? PlayVipBilling(vipProduct, (owned) async {
           await loaded;
           if (profile.vip != owned) {
@@ -73,9 +78,11 @@ Future<void> main() async {
   }
   final startup = Future.wait<void>([
     loaded,
+    cloudStartup.timeout(const Duration(seconds: 2), onTimeout: () {}),
     Future<void>.delayed(const Duration(milliseconds: 850)),
   ]);
-  final useAndroidQaAds = kDebugMode && standardAndroid;
+  final useAndroidQaAds =
+      (kDebugMode || orbitClosedTestAds || orbitAdsTestApk) && standardAndroid;
   runApp(
     OrbitApp(
       profile: profile,
@@ -99,6 +106,58 @@ Future<void> main() async {
   );
 }
 
+class CampaignCloudSync {
+  CampaignCloudSync(this.profile);
+
+  static const _channel = MethodChannel('orbit_arrow/cloud_save');
+  final Profile profile;
+  String? _lastSynced;
+  bool _syncing = false;
+
+  Future<void> start() {
+    profile.syncCampaignWithPlayGames = () => _sync(force: true, signIn: true);
+    profile.addListener(_onProgressChanged);
+    AppLifecycleListener(onResume: () => unawaited(_sync(force: true)));
+    Timer.periodic(const Duration(minutes: 1), (_) {
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        unawaited(_sync(force: true));
+      }
+    });
+    return _sync(force: true).then((_) {});
+  }
+
+  void _onProgressChanged() => unawaited(_sync());
+
+  Future<bool> _sync({bool force = false, bool signIn = false}) async {
+    if (_syncing) return false;
+    final snapshot = profile.exportCampaign();
+    if (!force && snapshot == _lastSynced) return true;
+    _syncing = true;
+    var followUp = false;
+    try {
+      final cloud = await _channel.invokeMethod<String>(
+        signIn ? 'signInAndSync' : 'sync',
+        snapshot,
+      );
+      if (cloud == null) return false;
+      final beforeMerge = profile.exportCampaign();
+      if (await profile.restoreCampaign(cloud)) {
+        _lastSynced = profile.exportCampaign();
+        followUp = beforeMerge != snapshot || _lastSynced != cloud;
+        return true;
+      }
+    } on PlatformException catch (error) {
+      debugPrint('Play Games campaign sync: ${error.code}');
+    } on FormatException {
+      debugPrint('Play Games returned invalid campaign progress.');
+    } finally {
+      _syncing = false;
+      if (followUp) unawaited(_sync(force: true));
+    }
+    return false;
+  }
+}
+
 Future<bool> showInterstitial() async {
   final result = Completer<bool>();
 
@@ -111,7 +170,7 @@ Future<bool> showInterstitial() async {
   try {
     await MobileAds.instance.initialize();
     await InterstitialAd.load(
-      adUnitId: 'ca-app-pub-6100694034284720/3165958961',
+      adUnitId: 'ca-app-pub-3940256099942544/1033173712',
       request: const AdRequest(),
       adLoadCallback: InterstitialAdLoadCallback(
         onAdLoaded: (ad) async {
@@ -235,10 +294,11 @@ class Profile extends ChangeNotifier {
   bool get fullAccess => vip || testEdition;
   int enteredThrough = 1;
   int lastCampaign = 1;
+  Future<bool> Function()? syncCampaignWithPlayGames;
   int clearsTowardAd = 0;
 
   bool canSelectStage(int stage) =>
-      stage >= 1 && stage <= 250 && (fullAccess || stage <= unlocked);
+      stage >= 1 && stage <= 250 && (testEdition || stage <= unlocked);
   int stagePrice(int stage) {
     if (fullAccess || stage <= enteredThrough) return 0;
     // Preserve free entry in ranges already bought before the VIP update.
@@ -259,8 +319,11 @@ class Profile extends ChangeNotifier {
     return true;
   }
 
-  bool ownsArrow(Skin skin) => fullAccess || owned.contains(skin.id);
-  bool ownsWheel(WheelSkin wheel) => fullAccess || ownedWheels.contains(wheel);
+  bool ownsArrow(Skin skin) =>
+      testEdition ||
+      owned.contains(skin.id) ||
+      (vip && (skin.id == 'royal' || skin.id == 'omega'));
+  bool ownsWheel(WheelSkin wheel) => testEdition || ownedWheels.contains(wheel);
 
   bool equipArrow(Skin skin) {
     if (!ownsArrow(skin)) {
@@ -346,9 +409,101 @@ class Profile extends ChangeNotifier {
   }
 
   Map<int, int> stars = {};
+  int _walletUpdatedAt = 0;
+  int _savedGemBalance = 0;
   String? storageError;
   Future<void> _writes = Future<void>.value();
   static const key = 'orbit.overdrive.profile.v1';
+
+  String exportCampaign() => jsonEncode({
+    'format': 'orbit.campaign.v1',
+    'unlocked': unlocked,
+    'enteredThrough': enteredThrough,
+    'stars': {
+      for (final stage in stars.keys.toList()..sort())
+        if (stars[stage]! > 0) '$stage': stars[stage],
+    },
+    if (_walletUpdatedAt > 0)
+      'wallet': {'updatedAt': _walletUpdatedAt, 'gems': _savedGemBalance},
+  });
+
+  Future<bool> restoreCampaign(String json) async {
+    final data = jsonDecode(json);
+    if (data is! Map || data['format'] != 'orbit.campaign.v1') {
+      throw const FormatException('Unknown campaign backup format');
+    }
+    final frontier = data['unlocked'];
+    final paidThrough = data['enteredThrough'];
+    final ratings = data['stars'];
+    final wallet = data['wallet'];
+    final walletUpdatedAt = wallet is Map ? wallet['updatedAt'] : null;
+    final walletGems = wallet is Map ? wallet['gems'] : null;
+    if (frontier is! int ||
+        frontier < 1 ||
+        frontier > 250 ||
+        paidThrough is! int ||
+        paidThrough < 1 ||
+        paidThrough > frontier ||
+        ratings is! Map) {
+      throw const FormatException('Invalid campaign backup');
+    }
+    if (wallet != null &&
+        (walletUpdatedAt is! int ||
+            walletUpdatedAt <= 0 ||
+            walletUpdatedAt > 9007199254740991 ||
+            walletGems is! int ||
+            walletGems < 0 ||
+            walletGems > 1000000000)) {
+      throw const FormatException('Invalid gem wallet backup');
+    }
+    final restored = <int, int>{};
+    for (final entry in ratings.entries) {
+      final stage = int.tryParse(entry.key.toString());
+      final rating = entry.value;
+      if (stage == null ||
+          stage < 1 ||
+          stage > 250 ||
+          rating is! int ||
+          rating < 0 ||
+          rating > 3) {
+        throw const FormatException('Invalid stage rating');
+      }
+      restored[stage] = rating;
+    }
+    final beforeMerge = exportCampaign();
+    if (walletUpdatedAt is int &&
+        walletGems is int &&
+        (walletUpdatedAt > _walletUpdatedAt ||
+            (walletUpdatedAt == _walletUpdatedAt && walletGems < gems))) {
+      _walletUpdatedAt = walletUpdatedAt;
+      gems = _savedGemBalance = walletGems;
+    }
+    final freshCampaign = unlocked == 1 && stars.isEmpty;
+    unlocked = math.max(unlocked, frontier);
+    enteredThrough = math.max(enteredThrough, paidThrough);
+    for (final entry in restored.entries) {
+      stars[entry.key] = math.max(stars[entry.key] ?? 0, entry.value);
+    }
+    if (freshCampaign) {
+      // A wiped profile has no gems to pay for the next campaign stage.
+      for (final entry in restored.entries) {
+        if (entry.value > 0) {
+          enteredThrough = math.max(
+            enteredThrough,
+            math.min(unlocked, entry.key + 1),
+          );
+        }
+      }
+      lastCampaign = enteredThrough;
+    }
+    var changed = exportCampaign() != beforeMerge;
+    if ((stars[5] ?? 0) > 0) changed = owned.add('saw') || changed;
+    if ((stars[10] ?? 0) > 0) changed = owned.add('chrono') || changed;
+    if ((stars[250] ?? 0) > 0) changed = owned.add('omega') || changed;
+    if (!changed && storageError == null) return true;
+    await save();
+    return storageError == null;
+  }
 
   Future<void> load() async {
     try {
@@ -370,6 +525,12 @@ class Profile extends ChangeNotifier {
           ? d['stageSkipDay'] as String
           : '';
       gems = integer('gems', 0, 1000000000);
+      _savedGemBalance = gems;
+      _walletUpdatedAt = integer(
+        'walletUpdatedAt',
+        gems > 0 ? 1 : 0,
+        9007199254740991,
+      );
       bestWave = integer('bestWave', 0, 1000000000);
       bestScore = integer('bestScore', 0, 1000000000);
       vip = d['vip'] == true;
@@ -377,6 +538,11 @@ class Profile extends ChangeNotifier {
       if (savedWheels is List) {
         ownedWheels.addAll(
           WheelSkin.values.where((wheel) => savedWheels.contains(wheel.name)),
+        );
+      }
+      if (vip && d['version'] == 1) {
+        ownedWheels.addAll(
+          WheelSkin.values.where((wheel) => wheel.name == d['equippedWheel']),
         );
       }
       for (final wheel in WheelSkin.values.where(ownsWheel)) {
@@ -392,6 +558,13 @@ class Profile extends ChangeNotifier {
       if (d['owned'] is List) {
         owned.addAll(
           (d['owned'] as List).whereType<String>().where(known.contains),
+        );
+      }
+      if (vip && d['version'] == 1) {
+        owned.addAll(
+          skins
+              .where((skin) => skin.price > 0 && skin.id == d['equipped'])
+              .map((skin) => skin.id),
         );
       }
       if (skins.any((skin) => skin.id == d['equipped'] && ownsArrow(skin))) {
@@ -414,15 +587,23 @@ class Profile extends ChangeNotifier {
   Skin get skin =>
       skins.firstWhere((s) => s.id == equipped, orElse: () => skins.first);
   Future<void> save() {
+    if (gems != _savedGemBalance) {
+      _walletUpdatedAt = math.max(
+        DateTime.now().millisecondsSinceEpoch,
+        _walletUpdatedAt + 1,
+      );
+      _savedGemBalance = gems;
+    }
     notifyListeners();
     final snapshot = jsonEncode({
-      'version': 1,
+      'version': 2,
       'unlocked': unlocked,
       'enteredThrough': enteredThrough,
       'lastCampaign': lastCampaign,
       'clearsTowardAd': clearsTowardAd,
       'stageSkipDay': _stageSkipDay,
       'gems': gems,
+      'walletUpdatedAt': _walletUpdatedAt,
       'ownedWheels': ownedWheels.map((wheel) => wheel.name).toList(),
       'equippedWheel': equippedWheel.name,
       'gemRewardDay': _gemDay,
@@ -455,12 +636,7 @@ class Profile extends ChangeNotifier {
 
   Future<void> applyProducts(Set<String> products) {
     vip = products.contains(vipProduct);
-    if (!fullAccess) {
-      if (!owned.contains(equipped)) equipped = 'cyber';
-      if (!ownedWheels.contains(equippedWheel)) {
-        equippedWheel = WheelSkin.classic;
-      }
-    }
+    if (!ownsArrow(skin)) equipped = 'cyber';
     return save();
   }
 }
@@ -531,7 +707,9 @@ class Stage {
       speed = endless
           ? math.min(5.3, 1.7 + value * .085)
           : 1.65 + value * .009 + (value % 5 == 0 ? .3 : 0),
-      motion = Motion.values[(value - 1) % 4],
+      motion = !endless && value == 3
+          ? Motion.constant
+          : Motion.values[(value - 1) % 4],
       counter = endless ? value >= 9 : value >= 51,
       breath = endless ? value >= 9 : value >= 51,
       phantom = endless
@@ -585,14 +763,28 @@ class OrbitGame extends ChangeNotifier {
   final math.Random random = math.Random();
   final ValueNotifier<int> hud = ValueNotifier(0);
   OrbitGame(this.profile) {
+    level = _resumeStage;
+    _setup(Stage(level));
+    profile.addListener(_refreshResumeStage);
+  }
+
+  bool _startedPlaying = false;
+
+  int get _resumeStage {
     final saved = profile.lastCampaign;
-    final resume =
-        profile.canSelectStage(saved) && profile.stagePrice(saved) == 0
+    return profile.canSelectStage(saved) && profile.stagePrice(saved) == 0
         ? saved
         : math.min(profile.unlocked, profile.enteredThrough);
+  }
+
+  void _refreshResumeStage() {
+    if (_startedPlaying) return;
+    final resume = _resumeStage;
+    if (resume == level) return;
     level = resume;
     _setup(Stage(resume));
   }
+
   int campaignRetries = 0;
 
   bool isCampaignRetry(int stage) =>
@@ -635,7 +827,12 @@ class OrbitGame extends ChangeNotifier {
   }
 
   bool startCampaign(int n) {
-    if (!profile.enterStage(n)) return false;
+    final wasPlaying = _startedPlaying;
+    _startedPlaying = true;
+    if (!profile.enterStage(n)) {
+      _startedPlaying = wasPlaying;
+      return false;
+    }
     campaignRetries = isCampaignRetry(n) ? campaignRetries + 1 : 0;
     endless = false;
     level = n;
@@ -645,6 +842,7 @@ class OrbitGame extends ChangeNotifier {
   }
 
   void startEndless() {
+    _startedPlaying = true;
     endless = true;
     wave = 1;
     hearts = 3;
@@ -842,6 +1040,7 @@ class OrbitGame extends ChangeNotifier {
         remaining <= 0) {
       return;
     }
+    _startedPlaying = true;
     if (fever <= 0) {
       charge = (charge + (clock - lastShot < .95 ? .26 : .1)).clamp(0.0, 1.0);
       if (charge >= 1) {
@@ -1032,6 +1231,7 @@ class OrbitGame extends ChangeNotifier {
 
   @override
   void dispose() {
+    profile.removeListener(_refreshResumeStage);
     hud.dispose();
     super.dispose();
   }
@@ -1576,7 +1776,7 @@ class _GameScreenState extends State<GameScreen>
             ),
             const SizedBox(height: 12),
             const Text(
-              'All 250 stages open · every arrow and wheel skin, including Royal Comet · no entry fees · no ads',
+              'Ad-free play · free stage entry · Royal Comet and Omega Sovereign included. Clear stages in order and spend gems on other cosmetics.',
             ),
             const SizedBox(height: 12),
             FilledButton(
@@ -1726,7 +1926,7 @@ class _GameScreenState extends State<GameScreen>
                 builder: (dialogContext) => AlertDialog(
                   title: const Text('Orbit Arrow VIP'),
                   content: const Text(
-                    'Orbit Arrow promotion · Unlock all stages and skins and remove ads with the VIP pass.',
+                    'Play without ads or stage entry fees and get Royal Comet and Omega Sovereign.',
                   ),
                   actions: [
                     FilledButton(
@@ -1753,76 +1953,108 @@ class _GameScreenState extends State<GameScreen>
 
   Future<void> stages() async {
     int? selected;
+    String? syncStatus;
+    var syncing = false;
+    final sync = profile.syncCampaignWithPlayGames;
     await sheet(
       '250 ORBITS · 5 WORLDS',
       (context, update) => SizedBox(
         height: math.min(510.0, MediaQuery.sizeOf(context).height * .6),
         child: ListView.builder(
-          itemCount: 5,
-          itemBuilder: (context, world) => Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                child: Text(
-                  '${world + 1}  ${worldNames[world].toUpperCase()}',
-                  style: TextStyle(
-                    color: worldColors[world],
-                    fontWeight: FontWeight.w900,
+          itemCount: sync == null ? 5 : 6,
+          itemBuilder: (context, index) {
+            if (sync != null && index == 0) {
+              return Column(
+                children: [
+                  OutlinedButton(
+                    onPressed: syncing
+                        ? null
+                        : () async {
+                            update(() {
+                              syncing = true;
+                              syncStatus = null;
+                            });
+                            final synced = await sync();
+                            if (!context.mounted) return;
+                            update(() {
+                              syncing = false;
+                              syncStatus = synced
+                                  ? 'Campaign synced with Google Play Games.'
+                                  : 'Sync unavailable. Check your Play Games account and connection, then retry.';
+                            });
+                          },
+                    child: Text(syncing ? 'SYNCING…' : 'SYNC STAGES'),
+                  ),
+                  if (syncStatus != null) Text(syncStatus!),
+                ],
+              );
+            }
+            final world = sync == null ? index : index - 1;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    '${world + 1}  ${worldNames[world].toUpperCase()}',
+                    style: TextStyle(
+                      color: worldColors[world],
+                      fontWeight: FontWeight.w900,
+                    ),
                   ),
                 ),
-              ),
-              Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: List.generate(50, (index) {
-                  final n = world * 50 + index + 1;
-                  final available = profile.canSelectStage(n);
-                  return SizedBox(
-                    width: 62,
-                    height: 57,
-                    child: OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        padding: EdgeInsets.zero,
-                        foregroundColor: available
-                            ? worldColors[world]
-                            : Colors.white30,
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: List.generate(50, (index) {
+                    final n = world * 50 + index + 1;
+                    final available = profile.canSelectStage(n);
+                    return SizedBox(
+                      width: 62,
+                      height: 57,
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          foregroundColor: available
+                              ? worldColors[world]
+                              : Colors.white30,
+                        ),
+                        onPressed: () {
+                          if (!available) {
+                            message(
+                              'Clear stage ${profile.unlocked} to advance.',
+                            );
+                            return;
+                          }
+                          if (profile.gems < profile.stagePrice(n)) {
+                            message('You need 5 gems to enter this stage.');
+                            return;
+                          }
+                          selected = n;
+                          Navigator.pop(context);
+                        },
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              available ? '$n' : '🔒 $n',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                            Text(
+                              profile.stagePrice(n) > 0 && available
+                                  ? '5 💎'
+                                  : '★' * (profile.stars[n] ?? 0),
+                              style: const TextStyle(color: gold, fontSize: 10),
+                            ),
+                          ],
+                        ),
                       ),
-                      onPressed: () {
-                        if (!available) {
-                          message(
-                            'Clear stage ${profile.unlocked} to advance.',
-                          );
-                          return;
-                        }
-                        if (profile.gems < profile.stagePrice(n)) {
-                          message('You need 5 gems to enter this stage.');
-                          return;
-                        }
-                        selected = n;
-                        Navigator.pop(context);
-                      },
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text(
-                            available ? '$n' : '🔒 $n',
-                            style: const TextStyle(fontSize: 12),
-                          ),
-                          Text(
-                            profile.stagePrice(n) > 0 && available
-                                ? '5 💎'
-                                : '★' * (profile.stars[n] ?? 0),
-                            style: const TextStyle(color: gold, fontSize: 10),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                }),
-              ),
-            ],
-          ),
+                    );
+                  }),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );

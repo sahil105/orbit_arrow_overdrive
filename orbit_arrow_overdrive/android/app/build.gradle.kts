@@ -7,6 +7,12 @@ plugins {
 }
 
 val orbitTestEdition = System.getenv("ORBIT_TEST_EDITION") == "true"
+val orbitAdsTestApk = System.getenv("ORBIT_ADS_TEST_APK") == "true"
+val playGamesProjectId = providers.gradleProperty("orbitPlayGamesProjectId")
+    .getOrElse("791498391332")
+require(playGamesProjectId.isEmpty() || playGamesProjectId.all { it in '0'..'9' }) {
+    "orbitPlayGamesProjectId must be the numeric Play Games Services project ID"
+}
 val uploadPropertiesFile = rootProject.file("key.properties")
 val uploadProperties = Properties().apply {
     if (uploadPropertiesFile.isFile) {
@@ -16,6 +22,7 @@ val uploadProperties = Properties().apply {
 
 android {
     namespace = "dev.orbitarrow.orbit_arrow_overdrive"
+    buildFeatures { resValues = true }
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "30.0.16248370"
 
@@ -25,14 +32,20 @@ android {
     }
 
     defaultConfig {
+        val gamesId = if (orbitTestEdition || orbitAdsTestApk) "" else playGamesProjectId
+        resValue("string", "game_services_project_id", gamesId)
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = if (orbitTestEdition) {
             "dev.orbitarrow.orbit_arrow_overdrive.test"
         } else {
             "dev.orbitarrow.orbit_arrow_overdrive"
         }
-        manifestPlaceholders["orbitAppLabel"] =
-            if (orbitTestEdition) "Orbit Arrow Test" else "Orbit Arrow"
+        if (orbitAdsTestApk) applicationIdSuffix = ".adstest"
+        manifestPlaceholders["orbitAppLabel"] = when {
+            orbitAdsTestApk -> "Orbit Arrow Ads Test"
+            orbitTestEdition -> "Orbit Arrow Test"
+            else -> "Orbit Arrow"
+        }
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -70,6 +83,7 @@ android {
     }
     buildTypes {
         release {
+            proguardFiles("proguard-rules.pro")
             if (!orbitTestEdition && uploadPropertiesFile.isFile) {
                 signingConfig = signingConfigs.getByName("upload")
             } else if (orbitTestKeystore != null) {
@@ -77,6 +91,10 @@ android {
             }
         }
     }
+}
+
+dependencies {
+    implementation("com.google.android.gms:play-services-games-v2:22.1.0")
 }
 
 kotlin {

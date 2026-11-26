@@ -1,7 +1,7 @@
 name: orbit_arrow_overdrive
 description: Orbit Arrow Overdrive, a cross-platform CustomPainter arcade game.
 publish_to: none
-version: 1.4.1+15
+version: 1.4.6+20
 environment:
   sdk: '>=3.8.0 <4.0.0'
 dependencies:
